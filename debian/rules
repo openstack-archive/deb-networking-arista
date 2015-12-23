@@ -8,6 +8,10 @@ export OSLO_PACKAGE_VERSION=$(VERSION)
 %:
 	dh $@ --buildsystem=python_distutils --with python2
 
+override_dh_auto_install:
+	dh_auto_install
+	mv $(CURDIR)/debian/python-networking-arista/usr/etc $(CURDIR)/debian/python-networking-arista/
+
 override_dh_auto_test:
 ifeq (,$(findstring nocheck, $(DEB_BUILD_OPTIONS)))
 	@echo "===> Running tests"
