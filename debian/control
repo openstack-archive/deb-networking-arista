@@ -13,6 +13,7 @@ Build-Depends: debhelper (>= 9),
 Build-Depends-Indep: python-neutron (>= 1:7.0.0),
                      python-babel,
                      python-coverage,
+                     python-jsonrpclib,
                      python-hacking,
                      python-mock,
                      python-oslo.log (>= 0.4.0),
@@ -31,6 +32,7 @@ Package: python-networking-arista
 Architecture: all
 Section: python
 Depends: python-babel,
+         python-jsonrpclib,
          python-neutron (>= 1:7.0.0),
          python-oslo.log (>= 0.4.0),
          python-pbr (>= 0.11),
