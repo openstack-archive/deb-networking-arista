@@ -1,5 +1,4 @@
-# Copyright 2011 OpenStack Foundation.
-# All Rights Reserved.
+# Copyright (c) 2015 Arista Networks, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,8 +11,22 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
 
-from oslo_config import cfg
+"""Initial db version
+
+Revision ID: 47036dc8697a
+Create Date: 2015-10-23 14:37:49.594974
+
+"""
+
+from neutron.db.migration import cli
+
+# revision identifiers, used by Alembic.
+revision = '47036dc8697a'
+down_revision = '296b4e0236e0'
+branch_labels = (cli.CONTRACT_BRANCH,)
 
 
-cfg.CONF.use_stderr = False
+def upgrade():
+    pass

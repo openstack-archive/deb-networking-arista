@@ -17,11 +17,12 @@ import socket
 import struct
 
 import jsonrpclib
-from oslo.config import cfg
+from oslo_config import cfg
 from oslo_log import log as logging
 
 from neutron.i18n import _LI
-from neutron.plugins.ml2.drivers.arista import exceptions as arista_exc
+
+from networking_arista.common import exceptions as arista_exc
 
 LOG = logging.getLogger(__name__)
 
@@ -379,7 +380,7 @@ class AristaL3Driver(object):
             LOG.info(_LI('Results of execution on Arista EOS: %s'), ret)
 
         except Exception:
-            msg = (_('Error occured while trying to execute '
+            msg = (_('Error occurred while trying to execute '
                      'commands %(cmd)s on EOS %(host)s') %
                    {'cmd': full_command, 'host': server})
             LOG.exception(msg)

@@ -16,7 +16,8 @@
 from neutron import context as nctx
 import neutron.db.api as db
 from neutron.db import db_base_plugin_v2
-from neutron.plugins.ml2.drivers.arista import db as db_models
+
+from networking_arista.common import db as db_models
 
 VLAN_SEGMENTATION = 'vlan'
 
@@ -76,6 +77,25 @@ def remember_vm(vm_id, host_id, port_id, network_id, tenant_id):
             network_id=network_id,
             tenant_id=tenant_id)
         session.add(vm)
+
+
+def update_vm_host(vm_id, host_id, port_id, network_id, tenant_id):
+    """Updates the VM host id in the database.
+
+    :param vm_id: globally unique identifier for VM instance
+    :param host_id: ID of the new host where the VM is placed
+    :param port_id: globally unique port ID that connects VM to network
+    :param network_id: globally unique neutron network identifier
+    :param tenant_id: globally unique neutron tenant identifier
+    """
+    session = db.get_session()
+    with session.begin():
+        vm = session.query(db_models.AristaProvisionedVms).filter_by(
+            vm_id=vm_id, port_id=port_id, tenant_id=tenant_id,
+            network_id=network_id).first()
+        if vm:
+            # Update the VM's host id
+            vm.host_id = host_id
 
 
 def forget_vm(vm_id, host_id, port_id, network_id, tenant_id):
@@ -229,9 +249,15 @@ def get_networks(tenant_id):
         # hack for pep8 E711: comparison to None should be
         # 'if cond is not None'
         none = None
-        all_nets = (session.query(model).
-                    filter(model.tenant_id == tenant_id,
-                           model.segmentation_id != none))
+        all_nets = []
+        if tenant_id != 'any':
+            all_nets = (session.query(model).
+                        filter(model.tenant_id == tenant_id,
+                               model.segmentation_id != none))
+        else:
+            all_nets = (session.query(model).
+                        filter(model.segmentation_id != none))
+
         res = dict(
             (net.network_id, net.eos_network_representation(
                 VLAN_SEGMENTATION))
@@ -325,6 +351,9 @@ class NeutronNets(db_base_plugin_v2.NeutronDbPluginV2):
         filters = {'tenant_id': [tenant_id]}
         return super(NeutronNets,
                      self).get_networks(self.admin_ctx, filters=filters) or []
+
+    def get_all_networks(self):
+        return super(NeutronNets, self).get_networks(self.admin_ctx) or []
 
     def get_all_ports_for_tenant(self, tenant_id):
         filters = {'tenant_id': [tenant_id]}

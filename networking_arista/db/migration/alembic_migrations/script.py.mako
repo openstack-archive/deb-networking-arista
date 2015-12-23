@@ -1,5 +1,4 @@
-# Copyright 2011 OpenStack Foundation.
-# All Rights Reserved.
+# Copyright ${create_date.year} Arista Networks, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,8 +11,26 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
 
-from oslo_config import cfg
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+
+# revision identifiers, used by Alembic.
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
 
 
-cfg.CONF.use_stderr = False
+def upgrade():
+    ${upgrades if upgrades else "pass"}
