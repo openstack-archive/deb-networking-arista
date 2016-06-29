@@ -7,6 +7,7 @@ networking-arista (2016.1.0-1) unstable; urgency=medium
 
   [ Thomas Goirand ]
   * New upstream release.
+  * Fixed debian/copyright ordering.
 
  -- Thomas Goirand <zigo@debian.org>  Wed, 29 Jun 2016 14:10:22 +0200
 
