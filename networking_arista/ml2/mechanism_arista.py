@@ -32,8 +32,21 @@ from networking_arista.ml2 import arista_ml2
 
 LOG = logging.getLogger(__name__)
 
+# Messages
 EOS_UNREACHABLE_MSG = _('Unable to reach EOS')
+UNABLE_TO_DELETE_PORT_MSG = _('Unable to delete port from EOS')
+UNABLE_TO_DELETE_DEVICE_MSG = _('Unable to delete device')
+
+# Constants
 INTERNAL_TENANT_ID = 'INTERNAL-TENANT-ID'
+PORT_BINDING_HOST = 'binding:host_id'
+
+
+def pretty_log(tag, obj):
+    import json
+    log_data = json.dumps(obj, sort_keys=True, indent=4)
+    LOG.debug(tag)
+    LOG.debug(log_data)
 
 
 class AristaDriver(driver_api.MechanismDriver):
@@ -160,7 +173,12 @@ class AristaDriver(driver_api.MechanismDriver):
         tenant_id = network['tenant_id'] or INTERNAL_TENANT_ID
         with self.eos_sync_lock:
             if db_lib.is_network_provisioned(tenant_id, network_id):
-                db_lib.forget_network(tenant_id, network_id)
+                if db_lib.are_ports_attached_to_network(network_id):
+                    LOG.info(_LI('Network %s can not be deleted as it '
+                                 'has ports attached to it'), network_id)
+                    raise ml2_exc.MechanismDriverError()
+                else:
+                    db_lib.forget_network(tenant_id, network_id)
 
     def delete_network_postcommit(self, context):
         """Send network delete request to Arista HW."""
@@ -195,6 +213,8 @@ class AristaDriver(driver_api.MechanismDriver):
         device_owner = port['device_owner']
         host = context.host
 
+        pretty_log("create_port_precommit:", port)
+
         # device_id and device_owner are set on VM boot
         is_vm_boot = device_id and device_owner
         if host and is_vm_boot:
@@ -204,11 +224,7 @@ class AristaDriver(driver_api.MechanismDriver):
             with self.eos_sync_lock:
                 # If network does not exist under this tenant,
                 # it may be a shared network. Get shared network owner Id
-                net_provisioned = (
-                    db_lib.is_network_provisioned(tenant_id, network_id) or
-                    self.ndb.get_shared_network_owner_id(network_id)
-                )
-                if not net_provisioned:
+                if not self._network_provisioned(tenant_id, network_id):
                     # Ignore this request if network is not provisioned
                     return
                 db_lib.remember_tenant(tenant_id)
@@ -226,6 +242,8 @@ class AristaDriver(driver_api.MechanismDriver):
         device_owner = port['device_owner']
         host = context.host
 
+        pretty_log("create_port_postcommit:", port)
+
         # device_id and device_owner are set on VM boot
         is_vm_boot = device_id and device_owner
         if host and is_vm_boot:
@@ -235,18 +253,11 @@ class AristaDriver(driver_api.MechanismDriver):
             tenant_id = port['tenant_id'] or INTERNAL_TENANT_ID
             with self.eos_sync_lock:
                 hostname = self._host_name(host)
-                vm_provisioned = db_lib.is_vm_provisioned(device_id,
-                                                          host,
-                                                          port_id,
-                                                          network_id,
-                                                          tenant_id)
+                port_provisioned = db_lib.is_port_provisioned(port_id)
                 # If network does not exist under this tenant,
                 # it may be a shared network. Get shared network owner Id
-                net_provisioned = (
-                    db_lib.is_network_provisioned(tenant_id, network_id) or
-                    self.ndb.get_shared_network_owner_id(network_id)
-                )
-                if vm_provisioned and net_provisioned:
+                if port_provisioned and self._network_provisioned(tenant_id,
+                                                                  network_id):
                     try:
                         self.rpc.plug_port_into_network(device_id,
                                                         hostname,
@@ -276,18 +287,72 @@ class AristaDriver(driver_api.MechanismDriver):
             LOG.info(_LI('Port name changed to %s'), new_port['name'])
         new_port = context.current
         device_id = new_port['device_id']
-        device_owner = new_port['device_owner']
         host = context.host
 
+        pretty_log("update_port_precommit: new", new_port)
+        pretty_log("update_port_precommit: orig", orig_port)
+
         # device_id and device_owner are set on VM boot
-        is_vm_boot = device_id and device_owner
-        if host and host != orig_port['binding:host_id'] and is_vm_boot:
-            port_id = new_port['id']
-            network_id = new_port['network_id']
-            tenant_id = new_port['tenant_id'] or INTERNAL_TENANT_ID
-            with self.eos_sync_lock:
-                db_lib.update_vm_host(device_id, host, port_id,
-                                      network_id, tenant_id)
+        port_id = new_port['id']
+        network_id = new_port['network_id']
+        tenant_id = new_port['tenant_id'] or INTERNAL_TENANT_ID
+
+        if not self._network_provisioned(tenant_id, network_id):
+            # If the Arista driver does not know about the network, ignore the
+            # port.
+            LOG.info(_LI("Ignoring port connected to %s"), network_id)
+            return
+
+        with self.eos_sync_lock:
+            port_down = False
+            if(new_port['device_owner'] ==
+               n_const.DEVICE_OWNER_DVR_INTERFACE):
+                # We care about port status only for DVR ports because
+                # for DVR, a single port exists on multiple hosts. If a port
+                # is no longer needed on a host then the driver gets a
+                # port_update notification for that <port, host> with the
+                # port status as PORT_STATUS_DOWN.
+                port_down = context.status == n_const.PORT_STATUS_DOWN
+
+            if host and not port_down:
+                port_host_filter = None
+                if(new_port['device_owner'] ==
+                   n_const.DEVICE_OWNER_DVR_INTERFACE):
+                    # <port, host> uniquely identifies a DVR port. Other
+                    # ports are identified by just the port id
+                    port_host_filter = host
+
+                port_provisioned = db_lib.is_port_provisioned(
+                    port_id, port_host_filter)
+
+                if not port_provisioned:
+                    LOG.info("Remembering the port")
+                    # Create a new port in the DB
+                    db_lib.remember_tenant(tenant_id)
+                    db_lib.remember_vm(device_id, host, port_id,
+                                       network_id, tenant_id)
+                else:
+                    if(new_port['device_id'] != orig_port['device_id'] or
+                       context.host != context.original_host or
+                       new_port['network_id'] != orig_port['network_id'] or
+                       new_port['tenant_id'] != orig_port['tenant_id']):
+                        LOG.info("Updating the port")
+                        # Port exists in the DB. Update it
+                        db_lib.update_port(device_id, host, port_id,
+                                           network_id, tenant_id)
+            else:  # Unbound or down port does not concern us
+                orig_host = context.original_host
+                LOG.info("Forgetting the port on %s" % str(orig_host))
+                db_lib.forget_port(port_id, orig_host)
+
+    def _port_updated(self, context):
+        """Returns true if any port parameters have changed."""
+        new_port = context.current
+        orig_port = context.original
+        return (new_port['device_id'] != orig_port['device_id'] or
+                context.host != context.original_host or
+                new_port['network_id'] != orig_port['network_id'] or
+                new_port['tenant_id'] != orig_port['tenant_id'])
 
     def update_port_postcommit(self, context):
         """Update the name of a given port in EOS.
@@ -303,63 +368,78 @@ class AristaDriver(driver_api.MechanismDriver):
         host = context.host
         is_vm_boot = device_id and device_owner
 
-        if host and is_vm_boot:
-            port_id = port['id']
-            port_name = port['name']
-            network_id = port['network_id']
-            tenant_id = port['tenant_id'] or INTERNAL_TENANT_ID
-            with self.eos_sync_lock:
-                hostname = self._host_name(host)
-                segmentation_id = db_lib.get_segmentation_id(tenant_id,
-                                                             network_id)
-                vm_provisioned = db_lib.is_vm_provisioned(device_id,
-                                                          host,
-                                                          port_id,
-                                                          network_id,
-                                                          tenant_id)
-                # If network does not exist under this tenant,
-                # it may be a shared network. Get shared network owner Id
-                net_provisioned = (
-                    db_lib.is_network_provisioned(tenant_id, network_id,
-                                                  segmentation_id) or
-                    self.ndb.get_shared_network_owner_id(network_id)
-                )
-                if vm_provisioned and net_provisioned:
+        port_id = port['id']
+        port_name = port['name']
+        network_id = port['network_id']
+        tenant_id = port['tenant_id'] or INTERNAL_TENANT_ID
+
+        pretty_log("update_port_postcommit: new", port)
+        pretty_log("update_port_postcommit: orig", orig_port)
+
+        with self.eos_sync_lock:
+            hostname = self._host_name(host)
+            segmentation_id = db_lib.get_segmentation_id(tenant_id,
+                                                         network_id)
+            port_host_filter = None
+            if(port['device_owner'] ==
+               n_const.DEVICE_OWNER_DVR_INTERFACE):
+                # <port, host> uniquely identifies a DVR port. Other
+                # ports are identified by just the port id
+                port_host_filter = host
+
+            port_provisioned = db_lib.is_port_provisioned(port_id,
+                                                          port_host_filter)
+            # If network does not exist under this tenant,
+            # it may be a shared network. Get shared network owner Id
+            net_provisioned = self._network_provisioned(tenant_id, network_id,
+                                                        segmentation_id)
+            try:
+                orig_host = context.original_host
+                port_down = False
+                if(port['device_owner'] == n_const.DEVICE_OWNER_DVR_INTERFACE):
+                    # We care about port status only for DVR ports
+                    port_down = context.status == n_const.PORT_STATUS_DOWN
+
+                if orig_host and (port_down or host != orig_host):
                     try:
-                        orig_host = orig_port['binding:host_id']
-                        if host != orig_host:
-                            # The port moved to a different host. So delete the
-                            # old port on the old host before creating a new
-                            # port on the new host.
-                            self._delete_port(port, orig_host, tenant_id)
-                        self.rpc.plug_port_into_network(device_id,
-                                                        hostname,
-                                                        port_id,
-                                                        network_id,
-                                                        tenant_id,
-                                                        port_name,
-                                                        device_owner)
-                    except arista_exc.AristaRpcError:
-                        LOG.info(EOS_UNREACHABLE_MSG)
-                        raise ml2_exc.MechanismDriverError()
+                        LOG.info("Deleting the port %s" % str(orig_port))
+                        # The port moved to a different host or the VM
+                        # connected to the port was deleted or its in DOWN
+                        # state. So delete the old port on the old host.
+                        self._delete_port(orig_port, orig_host, tenant_id)
+                    except ml2_exc.MechanismDriverError:
+                        # If deleting a port fails, then not much can be done
+                        # about it. Log a warning and move on.
+                        LOG.warn(UNABLE_TO_DELETE_PORT_MSG)
+                if(port_provisioned and net_provisioned and hostname and
+                   is_vm_boot and not port_down):
+                    LOG.info(_LI("Port plugged into network"))
+                    # Plug port into the network only if it exists in the db
+                    # and is bound to a host and the port is up.
+                    self.rpc.plug_port_into_network(device_id,
+                                                    hostname,
+                                                    port_id,
+                                                    network_id,
+                                                    tenant_id,
+                                                    port_name,
+                                                    device_owner)
                 else:
-                    LOG.info(_LI('VM %s is not updated as it is not found in '
-                                 'Arista DB'), device_id)
+                    LOG.info(_LI("Port not plugged into network"))
+            except arista_exc.AristaRpcError:
+                LOG.info(EOS_UNREACHABLE_MSG)
+                raise ml2_exc.MechanismDriverError()
 
     def delete_port_precommit(self, context):
         """Delete information about a VM and host from the DB."""
         port = context.current
 
-        host_id = context.host
-        device_id = port['device_id']
-        tenant_id = port['tenant_id'] or INTERNAL_TENANT_ID
-        network_id = port['network_id']
+        pretty_log("delete_port_precommit:", port)
+
         port_id = port['id']
+        host_id = context.host
         with self.eos_sync_lock:
-            if db_lib.is_vm_provisioned(device_id, host_id, port_id,
-                                        network_id, tenant_id):
-                db_lib.forget_vm(device_id, host_id, port_id,
-                                 network_id, tenant_id)
+            if db_lib.is_port_provisioned(port_id):
+                db_lib.forget_port(port_id, host_id)
 
     def delete_port_postcommit(self, context):
         """unPlug a physical host from a network.
@@ -371,8 +451,15 @@ class AristaDriver(driver_api.MechanismDriver):
         host = context.host
         tenant_id = port['tenant_id'] or INTERNAL_TENANT_ID
 
+        pretty_log("delete_port_postcommit:", port)
+
         with self.eos_sync_lock:
-            self._delete_port(port, host, tenant_id)
+            try:
+                self._delete_port(port, host, tenant_id)
+            except ml2_exc.MechanismDriverError:
+                # Can't do much if deleting a port failed.
+                # Log a warning and continue.
+                LOG.warn(UNABLE_TO_DELETE_PORT_MSG)
 
     def _delete_port(self, port, host, tenant_id):
         """Deletes the port from EOS.
@@ -388,29 +475,19 @@ class AristaDriver(driver_api.MechanismDriver):
         network_id = port['network_id']
         device_owner = port['device_owner']
 
+        if not device_id or not host:
+            LOG.warn(UNABLE_TO_DELETE_DEVICE_MSG)
+            return
+
         try:
-            # If network does not exist under this tenant,
-            # it may be a shared network. Get shared network owner Id
-            net_provisioned = (
-                db_lib.is_network_provisioned(tenant_id, network_id) or
-                self.ndb.get_shared_network_owner_id(network_id)
-            )
-            if not net_provisioned:
+            if not self._network_provisioned(tenant_id, network_id):
                 # If we do not have network associated with this, ignore it
                 return
             hostname = self._host_name(host)
-            if device_owner == n_const.DEVICE_OWNER_DHCP:
-                self.rpc.unplug_dhcp_port_from_network(device_id,
-                                                       hostname,
-                                                       port_id,
-                                                       network_id,
-                                                       tenant_id)
-            else:
-                self.rpc.unplug_host_from_network(device_id,
-                                                  hostname,
-                                                  port_id,
-                                                  network_id,
-                                                  tenant_id)
+            self.rpc.unplug_port_from_network(device_id, device_owner,
+                                              hostname, port_id, network_id,
+                                              tenant_id)
+
             # if necessary, delete tenant as well.
             self.delete_tenant(tenant_id)
         except arista_exc.AristaRpcError:
@@ -463,3 +540,15 @@ class AristaDriver(driver_api.MechanismDriver):
         for net_id in set(arista_db_nets.keys()).difference(neutron_net_ids):
             tenant_network = arista_db_nets[net_id]
             db_lib.forget_network(tenant_network['tenantId'], net_id)
+            db_lib.forget_all_ports_for_network(net_id)
+
+    def _network_provisioned(self, tenant_id, network_id,
+                             segmentation_id=None):
+        # If network does not exist under this tenant,
+        # it may be a shared network.
+
+        return (
+            db_lib.is_network_provisioned(tenant_id, network_id,
+                                          segmentation_id) or
+            self.ndb.get_shared_network_owner_id(network_id)
+        )

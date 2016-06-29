@@ -1,4 +1,4 @@
-# Copyright (c) 2013 OpenStack Foundation
+# Copyright (c) 2014 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import base64
-import itertools
+import json
 import os
 
-import jsonrpclib
 from oslo_config import cfg
 from oslo_log import log as logging
+import requests
 
 from neutron.common import constants as n_const
 from neutron.i18n import _LI
@@ -34,12 +34,18 @@ LOG = logging.getLogger(__name__)
 
 EOS_UNREACHABLE_MSG = _('Unable to reach EOS')
 DEFAULT_VLAN = 1
+
 # Insert a heartbeat command every 100 commands
 HEARTBEAT_INTERVAL = 100
 
 # Commands dict keys
 CMD_SYNC_HEARTBEAT = 'SYNC_HEARTBEAT'
 CMD_REGION_SYNC = 'REGION_SYNC'
+CMD_INSTANCE = 'INSTANCE'
+
+# EAPI error messages of interest
+ERR_CVX_NOT_LEADER = 'only available on cluster leader'
+ERR_DVR_NOT_SUPPORTED = 'EOS version on CVX does not support DVR'
 
 
 class AristaRPCWrapper(object):
@@ -51,15 +57,94 @@ class AristaRPCWrapper(object):
     """
     def __init__(self):
         self._validate_config()
-        self._server = None
         self._server_ip = None
         self.keystone_conf = cfg.CONF.keystone_authtoken
         self.region = cfg.CONF.ml2_arista.region_name
         self.sync_interval = cfg.CONF.ml2_arista.sync_interval
+        self.conn_timeout = cfg.CONF.ml2_arista.conn_timeout
+        self.eapi_hosts = cfg.CONF.ml2_arista.eapi_host.split(',')
+
         # The cli_commands dict stores the mapping between the CLI command key
         # and the actual CLI command.
         self.cli_commands = {}
         self.initialize_cli_commands()
+
+    def _send_eapi_req(self, cmds):
+        # This method handles all EAPI requests (using the requests library)
+        # and returns either None or response.json()['result'] from the EAPI
+        # request.
+        #
+        # Exceptions related to failures in connecting/ timeouts are caught
+        # here and logged. Other unexpected exceptions are logged and raised
+
+        request_headers = {}
+        request_headers['Content-Type'] = 'application/json'
+        request_headers['Accept'] = 'application/json'
+        url = self._eapi_host_url(host=self._server_ip)
+
+        params = {}
+        params['timestamps'] = "false"
+        params['format'] = "json"
+        params['version'] = 1
+        params['cmds'] = cmds
+
+        data = {}
+        data['id'] = "Arista ML2 driver"
+        data['method'] = "runCmds"
+        data['jsonrpc'] = "2.0"
+        data['params'] = params
+
+        response = None
+
+        try:
+            msg = (_('EAPI request to %(ip)s contains %(cmd)s') %
+                   {'ip': self._server_ip, 'cmd': json.dumps(data)})
+            LOG.info(msg)
+            response = requests.post(url, timeout=self.conn_timeout,
+                                     verify=False, data=json.dumps(data))
+            LOG.info(_LI('EAPI response contains: %s'), response.json())
+            try:
+                return response.json()['result']
+            except KeyError:
+                if response.json()['error']['code'] == 1002:
+                    for data in response.json()['error']['data']:
+                        if type(data) == dict and 'errors' in data:
+                            if ERR_CVX_NOT_LEADER in data['errors'][0]:
+                                msg = unicode("%s is not the master" % (
+                                              self._server_ip))
+                                LOG.info(msg)
+                                return None
+
+                msg = "Unexpected EAPI error"
+                LOG.info(msg)
+                raise arista_exc.AristaRpcError(msg=msg)
+        except requests.exceptions.ConnectionError:
+            msg = (_('Error while trying to connect to %(ip)s') %
+                   {'ip': self._server_ip})
+            LOG.warn(msg)
+            return None
+        except requests.exceptions.ConnectTimeout:
+            msg = (_('Timed out while trying to connect to %(ip)s') %
+                   {'ip': self._server_ip})
+            LOG.warn(msg)
+            return None
+        except requests.exceptions.Timeout:
+            msg = (_('Timed out during an EAPI request to %(ip)s') %
+                   {'ip': self._server_ip})
+            LOG.warn(msg)
+            return None
+        except requests.exceptions.InvalidURL:
+            msg = (_('Ignore attempt to connect to invalid URL %(ip)s') %
+                   {'ip': self._server_ip})
+            LOG.warn(msg)
+            return None
+        except ValueError:
+            LOG.info("Ignoring invalid JSON response")
+            return None
+        except Exception as error:
+            msg = unicode(error)
+            LOG.warn(msg)
+            raise
 
     def _get_exit_mode_cmds(self, modes):
         """Returns a list of 'exit' commands for the modes.
@@ -76,6 +161,7 @@ class AristaRPCWrapper(object):
         self.cli_commands['timestamp'] = []
         self.cli_commands[CMD_REGION_SYNC] = ''
         self.cli_commands[CMD_SYNC_HEARTBEAT] = ''
+        self.cli_commands['resource-pool'] = []
 
     def check_cli_commands(self):
         """Checks whether the CLI commands are valid.
@@ -120,16 +206,86 @@ class AristaRPCWrapper(object):
                    'no region %s' % test_region_name]
             self._run_eos_cmds(cmd)
 
+        # Check if the instance command exists
+        instance_command = [
+            'enable',
+            'configure',
+            'cvx',
+            'service openstack',
+            'region %s' % test_region_name,
+            'tenant t1',
+            'instance id i1 type router',
+        ]
+        try:
+            self._run_eos_cmds(instance_command)
+            self.cli_commands[CMD_INSTANCE] = 'instance'
+        except arista_exc.AristaRpcError:
+            self.cli_commands[CMD_INSTANCE] = None
+            LOG.warn(_LW("'instance' command is not available on EOS"))
+        finally:
+            cmd = ['enable', 'configure', 'cvx', 'service openstack',
+                   'no region %s' % test_region_name]
+            self._run_eos_cmds(cmd)
+
+    def check_vlan_type_driver_commands(self):
+        """Checks the validity of CLI commands for Arista's VLAN type driver.
+
+           This method tries to execute the commands used exclusively by the
+           arista_vlan type driver and stores the commands if they succeed.
+        """
+        cmd = ['show openstack resource-pool vlan region %s uuid'
+               % self.region]
+        try:
+            self._run_eos_cmds(cmd)
+            self.cli_commands['resource-pool'] = cmd
+        except arista_exc.AristaRpcError:
+            self.cli_commands['resource-pool'] = []
+            LOG.warn(
+                _LW("'resource-pool' command '%s' is not available on EOS"),
+                cmd)
+
     def _keystone_url(self):
-        keystone_auth_url = ('%s://%s:%s/v2.0/' %
-                             (self.keystone_conf.auth_protocol,
-                              self.keystone_conf.auth_host,
-                              self.keystone_conf.auth_port))
-        return keystone_auth_url
+        if self.keystone_conf.auth_uri:
+            auth_uri = self.keystone_conf.auth_uri.rstrip('/')
+        else:
+            auth_uri = (
+                '%(protocol)s://%(host)s:%(port)s' %
+                {'protocol': self.keystone_conf.auth_protocol,
+                 'host': self.keystone_conf.auth_host,
+                 'port': self.keystone_conf.auth_port})
+        return '%s/v2.0/' % auth_uri
 
     def _heartbeat_required(self, sync, counter=0):
         return (sync and self.cli_commands[CMD_SYNC_HEARTBEAT] and
                 (counter % HEARTBEAT_INTERVAL) == 0)
+
+    def get_vlan_assignment_uuid(self):
+        """Returns the UUID for the region's vlan assignment on CVX
+
+        :returns: string containing the region's vlan assignment UUID
+        """
+        vlan_uuid_cmd = self.cli_commands['resource-pool']
+        if vlan_uuid_cmd:
+            return self._run_eos_cmds(commands=vlan_uuid_cmd)[0]
+        return None
+
+    def get_vlan_allocation(self):
+        """Returns the status of the region's VLAN pool in CVX
+
+        :returns: dictionary containg the assigned, allocated and available
+                  VLANs for the region
+        """
+        if not self.cli_commands['resource-pool']:
+            LOG.warning(_('The version of CVX you are using does not support'
+                          'arista VLAN type driver.'))
+            return None
+        cmd = ['show openstack resource-pools region %s' % self.region]
+        command_output = self._run_eos_cmds(cmd)
+        if command_output:
+            phys_nets = command_output[0]['physicalNetwork']
+            if self.region in phys_nets.keys():
+                return phys_nets[self.region]['vlanPool']['default']
+        return None
 
     def get_tenants(self):
         """Returns dict of all tenants known by EOS.
@@ -143,32 +299,38 @@ class AristaRPCWrapper(object):
 
         return tenants
 
-    def plug_port_into_network(self, vm_id, host_id, port_id,
+    def plug_port_into_network(self, device_id, host_id, port_id,
                                net_id, tenant_id, port_name, device_owner):
         """Generic routine plug a port of a VM instace into network.
 
-        :param vm_id: globally unique identifier for VM instance
-        :param host: ID of the host where the VM is placed
-        :param port_id: globally unique port ID that connects VM to network
+        :param device_id: globally unique identifier for the device
+        :param host: ID of the host where the port is placed
+        :param port_id: globally unique port ID that connects port to network
         :param network_id: globally unique neutron network identifier
         :param tenant_id: globally unique neutron tenant identifier
         :param port_name: Name of the port - for display purposes
         :param device_owner: Device owner - e.g. compute or network:dhcp
         """
         if device_owner == n_const.DEVICE_OWNER_DHCP:
-            self.plug_dhcp_port_into_network(vm_id,
+            self.plug_dhcp_port_into_network(device_id,
                                              host_id,
                                              port_id,
                                              net_id,
                                              tenant_id,
                                              port_name)
         elif device_owner.startswith('compute'):
-            self.plug_host_into_network(vm_id,
+            self.plug_host_into_network(device_id,
                                         host_id,
                                         port_id,
                                         net_id,
                                         tenant_id,
                                         port_name)
+        elif device_owner == n_const.DEVICE_OWNER_DVR_INTERFACE:
+            self.plug_distributed_router_port_into_network(device_id,
+                                                           host_id,
+                                                           port_id,
+                                                           net_id,
+                                                           tenant_id)
 
     def plug_host_into_network(self, vm_id, host, port_id,
                                network_id, tenant_id, port_name):
@@ -212,6 +374,54 @@ class AristaRPCWrapper(object):
                         (dhcp_id, host, port_id))
         self._run_openstack_cmds(cmds)
 
+    def plug_distributed_router_port_into_network(self, router_id, host,
+                                                  port_id, net_id, tenant_id):
+        """Creates a DVR port on EOS.
+
+        :param router_id: globally unique identifier for router instance
+        :param host: ID of the host where the DVR port is placed
+        :param port_id: globally unique port ID that connects port to network
+        :param network_id: globally unique neutron network identifier
+        :param tenant_id: globally unique neutron tenant identifier
+        """
+
+        if not self.cli_commands[CMD_INSTANCE]:
+            LOG.info(ERR_DVR_NOT_SUPPORTED)
+            return
+
+        cmds = ['tenant %s' % tenant_id,
+                'instance id %s type router' % router_id,
+                'port id %s network-id %s hostid %s' % (port_id, net_id, host)]
+        self._run_openstack_cmds(cmds)
+
+    def unplug_port_from_network(self, device_id, device_owner, hostname,
+                                 port_id, network_id, tenant_id):
+        """Removes a port from the device
+
+        :param device_id: globally unique identifier for the device
+        :param host: ID of the host where the device is placed
+        :param port_id: globally unique port ID that connects device to network
+        :param network_id: globally unique neutron network identifier
+        :param tenant_id: globally unique neutron tenant identifier
+        """
+        if device_owner == n_const.DEVICE_OWNER_DHCP:
+            self.unplug_dhcp_port_from_network(device_id,
+                                               hostname,
+                                               port_id,
+                                               network_id,
+                                               tenant_id)
+        elif device_owner.startswith('compute'):
+            self.unplug_host_from_network(device_id,
+                                          hostname,
+                                          port_id,
+                                          network_id,
+                                          tenant_id)
+        elif device_owner == n_const.DEVICE_OWNER_DVR_INTERFACE:
+            self.unplug_distributed_router_port_from_network(device_id,
+                                                             port_id,
+                                                             hostname,
+                                                             tenant_id)
+
     def unplug_host_from_network(self, vm_id, host, port_id,
                                  network_id, tenant_id):
         """Removes previously configured VLAN between TOR and a host.
@@ -242,6 +452,26 @@ class AristaRPCWrapper(object):
                 'network id %s' % network_id,
                 'no dhcp id %s port-id %s' % (dhcp_id, port_id),
                 ]
+        self._run_openstack_cmds(cmds)
+
+    def unplug_distributed_router_port_from_network(self, router_id,
+                                                    port_id, host, tenant_id):
+        """Removes a DVR port from EOS.
+
+        :param router_id: globally unique identifier for router instance
+        :param port_id: globally unique port ID that connects port to network
+        :param host: ID of the host where the dhcp is hosted
+        :param tenant_id: globally unique neutron tenant identifier
+        """
+
+        if not self.cli_commands[CMD_INSTANCE]:
+            LOG.info(ERR_DVR_NOT_SUPPORTED)
+            return
+
+        # When the last router port is removed, the router is deleted from EOS.
+        cmds = ['tenant %s' % tenant_id,
+                'instance id %s type router' % router_id,
+                'no port id %s hostid %s' % (port_id, host)]
         self._run_openstack_cmds(cmds)
 
     def create_network(self, tenant_id, network):
@@ -366,41 +596,76 @@ class AristaRPCWrapper(object):
             cmds.append(self.cli_commands[CMD_SYNC_HEARTBEAT])
         self._run_openstack_cmds(cmds, sync=sync)
 
-    def create_vm_port_bulk(self, tenant_id, vm_port_list, vms, sync=False):
+    def delete_instance_bulk(self, tenant_id, instance_id_list, sync=False):
+        """Deletes instances from EOS for a given tenant
+
+        :param tenant_id : globally unique neutron tenant identifier
+        :param instance_id_list : ids of instances that needs to be deleted.
+        :param sync: This flags indicates that the region is being synced.
+        """
+        cmds = ['tenant %s' % tenant_id]
+        counter = 0
+        for instance in instance_id_list:
+            counter += 1
+            cmds.append('no instance id %s' % instance)
+            if self._heartbeat_required(sync, counter):
+                cmds.append(self.cli_commands[CMD_SYNC_HEARTBEAT])
+
+        if self._heartbeat_required(sync):
+            cmds.append(self.cli_commands[CMD_SYNC_HEARTBEAT])
+        self._run_openstack_cmds(cmds, sync=sync)
+
+    def create_port_bulk(self, tenant_id, neutron_ports, arista_ports,
+                         sync=False):
         """Sends a bulk request to create ports.
 
         :param tenant_id: globaly unique neutron tenant identifier
-        :param vm_port_list: list of ports that need to be created.
-        :param vms: list of vms to which the ports will be attached to.
+        :param neutron_ports: list of neutron ports that need to be created.
+        :param arista_ports: list of ports in the arista db.
         :param sync: This flags indicates that the region is being synced.
         """
         cmds = ['tenant %s' % tenant_id]
         # Create a reference to function to avoid name lookups in the loop
         append_cmd = cmds.append
         counter = 0
-        for port in vm_port_list:
+        for neutron_port in neutron_ports:
             counter += 1
             try:
-                vm = vms[port['device_id']]
+                port = arista_ports[neutron_port['id']]
             except KeyError:
-                LOG.warn(_LW("VM id %(vmid)s not found for port %(portid)s"),
-                         {'vmid': port['device_id'], 'portid': port['id']})
+                LOG.warn(_LW(
+                         "Device id %(device)s not found for port %(port)s"),
+                         {'device': neutron_port['device_id'],
+                          'port': neutron_port['id']})
                 continue
 
-            port_name = '' if 'name' not in port else 'name "%s"' % (
-                port['name']
+            port_name = '' if 'name' not in neutron_port else 'name "%s"' % (
+                neutron_port['name']
             )
 
-            if port['device_owner'] == n_const.DEVICE_OWNER_DHCP:
-                append_cmd('network id %s' % port['network_id'])
+            device_owner = neutron_port['device_owner']
+            if device_owner == n_const.DEVICE_OWNER_DHCP:
+                append_cmd('network id %s' % neutron_port['network_id'])
                 append_cmd('dhcp id %s hostid %s port-id %s %s' %
-                           (vm['vmId'], vm['host'], port['id'], port_name))
-            elif port['device_owner'].startswith('compute'):
-                append_cmd('vm id %s hostid %s' % (vm['vmId'], vm['host']))
+                           (port['deviceId'], port['hosts'][0],
+                            neutron_port['id'], port_name))
+            elif device_owner.startswith('compute'):
+                append_cmd('vm id %s hostid %s' % (port['deviceId'],
+                                                   port['hosts'][0]))
                 append_cmd('port id %s %s network-id %s' %
-                           (port['id'], port_name, port['network_id']))
+                           (neutron_port['id'], port_name,
+                            neutron_port['network_id']))
+            elif device_owner == n_const.DEVICE_OWNER_DVR_INTERFACE:
+                if not self.cli_commands[CMD_INSTANCE]:
+                    LOG.info(ERR_DVR_NOT_SUPPORTED)
+                    continue
+                append_cmd('instance id %s type router' % port['deviceId'])
+                for host in port['hosts']:
+                    append_cmd('port id %s network-id %s hostid %s' % (
+                               neutron_port['id'], neutron_port['network_id'],
+                               host))
             else:
-                LOG.warn(_LW("Unknown device owner: %s"), port['device_owner'])
+                LOG.warn(_LW("Unknown device owner: %s"), device_owner)
                 continue
             if self._heartbeat_required(sync, counter):
                 append_cmd(self.cli_commands[CMD_SYNC_HEARTBEAT])
@@ -482,8 +747,13 @@ class AristaRPCWrapper(object):
         """
         timestamp_cmd = self.cli_commands['timestamp']
         if timestamp_cmd:
-            return self._run_eos_cmds(commands=timestamp_cmd)[0]
-        return None
+            try:
+                return self._run_eos_cmds(commands=timestamp_cmd)[0]
+            except IndexError:
+                # EAPI request failed and so return none
+                msg = "Failed to get last sync timestamp; trigger full sync"
+                LOG.info(msg)
+                return None
 
     def _check_sync_lock(self, client):
         """Check if the lock is owned by this client.
@@ -542,47 +812,31 @@ class AristaRPCWrapper(object):
                                  param is logged.
         """
 
-        if self._server is None:
-            self._server_ip = self._get_eos_master()
-            if self._server_ip is None or self._server is None:
+        # Always figure out who is master (starting with the last known val)
+        try:
+            if self._get_eos_master() is None:
                 msg = "Failed to identify EOS master"
                 raise arista_exc.AristaRpcError(msg=msg)
+        except Exception:
+            raise
 
         log_cmds = commands
         if commands_to_log:
             log_cmds = commands_to_log
 
         LOG.info(_LI('Executing command on Arista EOS: %s'), log_cmds)
-
+        # this returns array of return values for every command in
+        # full_command list
         try:
-            # this returns array of return values for every command in
-            # full_command list
-            ret = self._server.runCmds(version=1, cmds=commands)
-        except Exception as error:
-            error_msg_str = unicode(error)
-            if commands_to_log:
-                # The command might contain sensitive information. If the
-                # command to log is different from the actual command, use
-                # that in the error message.
-                for cmd, log_cmd in itertools.izip(commands, log_cmds):
-                    error_msg_str = error_msg_str.replace(cmd, log_cmd)
-            msg = (_('Error %(err)s while trying to execute '
-                     'commands %(cmd)s on EOS %(host)s') %
-                   {'err': error_msg_str,
-                    'cmd': commands_to_log,
-                    'host': self._server_ip})
-
-            # Reset the server as we failed communicating with it;
-            # there might just be another master
-            self._server = None
-            self._server_ip = None
-
-            # Logging exception here can reveal passwords as the exception
-            # contains the CLI command which contains the credentials.
-            LOG.error(msg)
-            raise arista_exc.AristaRpcError(msg=msg)
-
-        return ret
+            response = self._send_eapi_req(cmds=commands)
+            if response is None:
+                # Reset the server as we failed communicating with it
+                self._server_ip = None
+                msg = "Failed to communicate with EOS master"
+                raise arista_exc.AristaRpcError(msg=msg)
+            return response
+        except arista_exc.AristaRpcError:
+            raise
 
     def _build_command(self, cmds, sync=False):
         """Build full EOS's openstack CLI command.
@@ -630,26 +884,31 @@ class AristaRPCWrapper(object):
         return self._run_eos_cmds(full_command, full_log_command)
 
     def _get_eos_master(self):
-        hosts = cfg.CONF.ml2_arista.eapi_host.split(',')
         # Use guarded command to figure out if this is the master
         cmd = ['show openstack agent uuid']
 
-        # Identify which host is currently the master
-        for host in hosts:
-            self._server = None
-            self._server = jsonrpclib.Server(self._eapi_host_url(host.strip()))
-            try:
-                self._run_eos_cmds(cmd)
-                return host
-            except Exception:
-                msg = (_LI('EOS %(host)s is not the current master') %
-                       {'host': host.strip()})
-                LOG.info(msg)
-                continue  # Try another instance in case of error
+        cvx = []
+        if self._server_ip:
+            # If we know the master's IP, let's start with that
+            cvx.append(self._server_ip)
 
-        # Couldn't find a host that is the leader and so returning none
-        self._server = None
-        msg = "Failed to identify EOS master"
+        for h in self.eapi_hosts:
+            if h.strip() not in cvx:
+                cvx.append(h.strip())
+
+        # Identify which EOS instance is currently the master
+        for self._server_ip in cvx:
+            try:
+                if self._send_eapi_req(cmds=cmd) is not None:
+                    return self._server_ip
+                else:
+                    continue  # Try another EOS instance
+            except Exception:
+                raise
+
+        # Couldn't find an instance that is the leader and returning none
+        self._server_ip = None
+        msg = "Failed to reach the EOS master"
         LOG.error(msg)
         return None
 
@@ -720,6 +979,8 @@ class SyncService(object):
         try:
             # Register with EOS to ensure that it has correct credentials
             self._rpc.register_with_eos(sync=True)
+            # Recheck whether the commands are still available
+            self._rpc.check_cli_commands()
             eos_tenants = self._rpc.get_tenants()
         except arista_exc.AristaRpcError:
             LOG.warning(EOS_UNREACHABLE_MSG)
@@ -754,33 +1015,53 @@ class SyncService(object):
         # In first loop, delete unwanted VM and networks and update networks
         # In second loop, update VMs. This is done to ensure that networks for
         # all tenats are updated before VMs are updated
-        vms_to_update = {}
-        for tenant in db_tenants:
+        instances_to_update = {}
+        for tenant in db_tenants.keys():
             db_nets = db_lib.get_networks(tenant)
-            db_vms = db_lib.get_vms(tenant)
+            db_instances = db_lib.get_vms(tenant)
+
             eos_nets = self._get_eos_networks(eos_tenants, tenant)
             eos_vms = self._get_eos_vms(eos_tenants, tenant)
+            eos_routers = self._get_eos_routers(eos_tenants, tenant)
 
             db_nets_key_set = frozenset(db_nets.keys())
-            db_vms_key_set = frozenset(db_vms.keys())
+            db_instances_key_set = frozenset(db_instances.keys())
             eos_nets_key_set = frozenset(eos_nets.keys())
             eos_vms_key_set = frozenset(eos_vms.keys())
+            eos_routers_key_set = frozenset(eos_routers.keys())
+
+            eos_instances_key_set = (eos_vms_key_set | eos_routers_key_set)
 
             # Find the networks that are present on EOS, but not in Neutron DB
             nets_to_delete = eos_nets_key_set.difference(db_nets_key_set)
 
             # Find the VMs that are present on EOS, but not in Neutron DB
-            vms_to_delete = eos_vms_key_set.difference(db_vms_key_set)
+            instances_to_delete = eos_instances_key_set.difference(
+                db_instances_key_set)
+
+            vms_to_delete = [
+                vm for vm in eos_vms_key_set if vm in instances_to_delete]
+            routers_to_delete = [
+                r for r in eos_routers_key_set if r in instances_to_delete]
 
             # Find the Networks that are present in Neutron DB, but not on EOS
             nets_to_update = db_nets_key_set.difference(eos_nets_key_set)
 
             # Find the VMs that are present in Neutron DB, but not on EOS
-            vms_to_update[tenant] = db_vms_key_set.difference(eos_vms_key_set)
+            instances_to_update[tenant] = db_instances_key_set.difference(
+                eos_instances_key_set)
 
             try:
                 if vms_to_delete:
                     self._rpc.delete_vm_bulk(tenant, vms_to_delete, sync=True)
+                if routers_to_delete:
+                    if self._rpc.cli_commands[CMD_INSTANCE]:
+                        self._rpc.delete_instance_bulk(tenant,
+                                                       routers_to_delete,
+                                                       sync=True)
+                    else:
+                        LOG.info(ERR_DVR_NOT_SUPPORTED)
+
                 if nets_to_delete:
                     self._rpc.delete_network_bulk(tenant, nets_to_delete,
                                                   sync=True)
@@ -803,20 +1084,21 @@ class SyncService(object):
                 self._force_sync = True
 
         # Now update the VMs
-        for tenant in vms_to_update:
-            if not vms_to_update[tenant]:
+        for tenant in instances_to_update:
+            if not instances_to_update[tenant]:
                 continue
             try:
                 # Filter the ports to only the vms that we are interested
                 # in.
-                vm_ports = [
-                    port for port in self._ndb.get_all_ports_for_tenant(
-                        tenant) if port['device_id'] in vms_to_update[tenant]
-                ]
-                if vm_ports:
-                    db_vms = db_lib.get_vms(tenant)
-                    self._rpc.create_vm_port_bulk(tenant, vm_ports, db_vms,
-                                                  sync=True)
+                relevant_ports = []
+                for port in self._ndb.get_all_ports_for_tenant(tenant):
+                    if port['device_id'] in instances_to_update[tenant]:
+                        relevant_ports.append(port)
+
+                if relevant_ports:
+                    db_ports = db_lib.get_ports(tenant)
+                    self._rpc.create_port_bulk(tenant, relevant_ports,
+                                               db_ports, sync=True)
             except arista_exc.AristaRpcError:
                 LOG.warning(EOS_UNREACHABLE_MSG)
                 self._force_sync = True
@@ -828,9 +1110,12 @@ class SyncService(object):
            timestamp stored locally.
         """
         eos_region_updated_times = self._rpc.get_region_updated_time()
-        return (self._region_updated_time and
-                (self._region_updated_time['regionTimestamp'] ==
-                 eos_region_updated_times['regionTimestamp']))
+        if eos_region_updated_times:
+            return (self._region_updated_time and
+                    (self._region_updated_time['regionTimestamp'] ==
+                     eos_region_updated_times['regionTimestamp']))
+        else:
+            return False
 
     def _sync_required(self):
         """"Check whether the sync is required."""
@@ -868,3 +1153,9 @@ class SyncService(object):
         if eos_tenants and tenant in eos_tenants:
             vms = eos_tenants[tenant]['tenantVmInstances']
         return vms
+
+    def _get_eos_routers(self, eos_tenants, tenant):
+        if eos_tenants and tenant in eos_tenants:
+            if 'tenantRouterInstances' in eos_tenants[tenant]:
+                return eos_tenants[tenant]['tenantRouterInstances']
+        return {}

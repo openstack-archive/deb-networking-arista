@@ -16,6 +16,9 @@
 from neutron import context as nctx
 import neutron.db.api as db
 from neutron.db import db_base_plugin_v2
+from neutron.plugins.common import constants as p_const
+from neutron.plugins.ml2 import db as ml2_db
+from neutron.plugins.ml2 import driver_api
 
 from networking_arista.common import db as db_models
 
@@ -29,8 +32,11 @@ def remember_tenant(tenant_id):
     """
     session = db.get_session()
     with session.begin():
-        tenant = db_models.AristaProvisionedTenants(tenant_id=tenant_id)
-        session.add(tenant)
+        tenant = (session.query(db_models.AristaProvisionedTenants).
+                  filter_by(tenant_id=tenant_id).first())
+        if not tenant:
+            tenant = db_models.AristaProvisionedTenants(tenant_id=tenant_id)
+            session.add(tenant)
 
 
 def forget_tenant(tenant_id):
@@ -79,8 +85,19 @@ def remember_vm(vm_id, host_id, port_id, network_id, tenant_id):
         session.add(vm)
 
 
-def update_vm_host(vm_id, host_id, port_id, network_id, tenant_id):
-    """Updates the VM host id in the database.
+def forget_all_ports_for_network(net_id):
+    """Removes all ports for a given network fron repository.
+
+    :param net_id: globally unique network ID
+    """
+    session = db.get_session()
+    with session.begin():
+        (session.query(db_models.AristaProvisionedVms).
+         filter_by(network_id=net_id).delete())
+
+
+def update_port(vm_id, host_id, port_id, network_id, tenant_id):
+    """Updates the port details in the database.
 
     :param vm_id: globally unique identifier for VM instance
     :param host_id: ID of the new host where the VM is placed
@@ -90,29 +107,27 @@ def update_vm_host(vm_id, host_id, port_id, network_id, tenant_id):
     """
     session = db.get_session()
     with session.begin():
-        vm = session.query(db_models.AristaProvisionedVms).filter_by(
-            vm_id=vm_id, port_id=port_id, tenant_id=tenant_id,
-            network_id=network_id).first()
-        if vm:
+        port = session.query(db_models.AristaProvisionedVms).filter_by(
+            port_id=port_id).first()
+        if port:
             # Update the VM's host id
-            vm.host_id = host_id
+            port.host_id = host_id
+            port.vm_id = vm_id
+            port.network_id = network_id
+            port.tenant_id = tenant_id
 
 
-def forget_vm(vm_id, host_id, port_id, network_id, tenant_id):
-    """Removes all relevant information about a VM from repository.
+def forget_port(port_id, host_id):
+    """Deletes the port from the database
 
-    :param vm_id: globally unique identifier for VM instance
-    :param host_id: ID of the host where the VM is placed
     :param port_id: globally unique port ID that connects VM to network
-    :param network_id: globally unique neutron network identifier
-    :param tenant_id: globally unique neutron tenant identifier
+    :param host_id: host to which the port is bound to
     """
     session = db.get_session()
     with session.begin():
-        (session.query(db_models.AristaProvisionedVms).
-         filter_by(vm_id=vm_id, host_id=host_id,
-                   port_id=port_id, tenant_id=tenant_id,
-                   network_id=network_id).delete())
+        session.query(db_models.AristaProvisionedVms).filter_by(
+            port_id=port_id,
+            host_id=host_id).delete()
 
 
 def remember_network(tenant_id, network_id, segmentation_id):
@@ -178,6 +193,27 @@ def is_vm_provisioned(vm_id, host_id, port_id,
                             network_id=network_id,
                             host_id=host_id).count())
         return num_vm > 0
+
+
+def is_port_provisioned(port_id, host_id=None):
+    """Checks if a port is already known to EOS
+
+    :returns: True, if yes; False otherwise.
+    :param port_id: globally unique port ID that connects VM to network
+    :param host_id: host to which the port is bound to
+    """
+
+    filters = {
+        'port_id': port_id
+    }
+    if host_id:
+        filters['host_id'] = host_id
+
+    session = db.get_session()
+    with session.begin():
+        num_ports = (session.query(db_models.AristaProvisionedVms).
+                     filter_by(**filters).count())
+        return num_ports > 0
 
 
 def is_network_provisioned(tenant_id, network_id, seg_id=None):
@@ -290,6 +326,20 @@ def get_vms(tenant_id):
         return res
 
 
+def are_ports_attached_to_network(net_id):
+    """Returns all records associated with network in EOS-compatible format.
+
+    :param net_id: globally unique network ID
+    """
+    session = db.get_session()
+    with session.begin():
+        model = db_models.AristaProvisionedVms
+        num_ports = (session.query(model).
+                     filter(model.network_id == net_id).count())
+
+        return num_ports > 0
+
+
 def get_ports(tenant_id):
     """Returns all ports of VMs in EOS-compatible format.
 
@@ -307,11 +357,14 @@ def get_ports(tenant_id):
                             model.vm_id != none,
                             model.network_id != none,
                             model.port_id != none))
-        res = dict(
-            (port.port_id, port.eos_port_representation())
-            for port in all_ports
-        )
-        return res
+
+    ports = {}
+    for port in all_ports:
+        if port.port_id not in ports:
+            ports[port.port_id] = port.eos_port_representation()
+        ports[port.port_id]['hosts'].append(port.host_id)
+
+    return ports
 
 
 def get_tenants():
@@ -363,9 +416,12 @@ class NeutronNets(db_base_plugin_v2.NeutronDbPluginV2):
     def get_shared_network_owner_id(self, network_id):
         filters = {'id': [network_id]}
         nets = self.get_networks(self.admin_ctx, filters=filters) or []
-        if not nets:
+        segments = ml2_db.get_network_segments(self.admin_ctx.session,
+                                               network_id)
+        if not nets or not segments:
             return
-        if nets[0]['shared']:
+        if (nets[0]['shared'] and
+           segments[0][driver_api.NETWORK_TYPE] == p_const.TYPE_VLAN):
             return nets[0]['tenant_id']
 
     def _get_network(self, tenant_id, network_id):

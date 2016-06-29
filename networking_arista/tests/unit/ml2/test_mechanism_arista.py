@@ -15,6 +15,7 @@
 
 import mock
 
+from neutron.common import constants as n_const
 from neutron.extensions import portbindings
 from neutron.tests.unit import testlib_api
 
@@ -150,10 +151,13 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.num_nets_provisioned.return_value = 0
         mechanism_arista.db_lib.num_vms_provisioned.return_value = 0
+        mechanism_arista.db_lib.are_ports_attached_to_network.return_value = (
+            False)
         self.drv.delete_network_precommit(network_context)
 
         expected_calls = [
             mock.call.is_network_provisioned(tenant_id, network_id),
+            mock.call.are_ports_attached_to_network(network_id),
             mock.call.forget_network(tenant_id, network_id),
         ]
 
@@ -173,11 +177,42 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.num_nets_provisioned.return_value = 0
         mechanism_arista.db_lib.num_vms_provisioned.return_value = 0
+        mechanism_arista.db_lib.are_ports_attached_to_network.return_value = (
+            False)
         self.drv.delete_network_precommit(network_context)
 
         expected_calls += [
             mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id),
+            mock.call.are_ports_attached_to_network(network_id),
             mock.call.forget_network(INTERNAL_TENANT_ID, network_id),
+        ]
+
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+    def test_delete_network_precommit_with_ports(self):
+        tenant_id = 'ten-1'
+        network_id = 'net1-id'
+        segmentation_id = 1001
+
+        network_context = self._get_network_context(tenant_id,
+                                                    network_id,
+                                                    segmentation_id,
+                                                    False)
+        mechanism_arista.db_lib.is_network_provisioned.return_value = True
+        mechanism_arista.db_lib.num_nets_provisioned.return_value = 0
+        mechanism_arista.db_lib.num_vms_provisioned.return_value = 0
+        mechanism_arista.db_lib.are_ports_attached_to_network.return_value = (
+            True)
+        try:
+            self.drv.delete_network_precommit(network_context)
+        except Exception:
+            # exception is expeted in this case - as network is not
+            # deleted in this case and exception is raised
+            pass
+
+        expected_calls = [
+            mock.call.is_network_provisioned(tenant_id, network_id),
+            mock.call.are_ports_attached_to_network(network_id),
         ]
 
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
@@ -249,7 +284,7 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.create_port_precommit(port_context)
 
         expected_calls = [
-            mock.call.is_network_provisioned(tenant_id, network_id),
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
             mock.call.remember_tenant(tenant_id),
             mock.call.remember_vm(vm_id, host_id, port_id,
                                   network_id, tenant_id)
@@ -279,7 +314,8 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.create_port_precommit(port_context)
 
         expected_calls += [
-            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id),
+            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
+                                             None),
             mock.call.remember_tenant(INTERNAL_TENANT_ID),
             mock.call.remember_vm(vm_id, host_id, port_id,
                                   network_id, INTERNAL_TENANT_ID)
@@ -300,7 +336,7 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               network_id,
                                               vm_id,
                                               network_context)
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.get_shared_network_owner_id.return_value = 1
 
@@ -314,9 +350,8 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.create_port_postcommit(port_context)
 
         expected_calls = [
-            mock.call.is_vm_provisioned(device_id, host_id, port_id,
-                                        network_id, tenant_id),
-            mock.call.is_network_provisioned(tenant_id, network_id),
+            mock.call.is_port_provisioned(port_id),
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
             mock.call.plug_port_into_network(device_id, host_id, port_id,
                                              network_id, tenant_id,
                                              port_name, device_owner)
@@ -340,7 +375,7 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               vm_id,
                                               network_context)
         port_context.current['tenant_id'] = ''
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.get_shared_network_owner_id.return_value = 1
 
@@ -354,9 +389,9 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.create_port_postcommit(port_context)
 
         expected_calls += [
-            mock.call.is_vm_provisioned(device_id, host_id, port_id,
-                                        network_id, INTERNAL_TENANT_ID),
-            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id),
+            mock.call.is_port_provisioned(port_id),
+            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
+                                             None),
             mock.call.plug_port_into_network(device_id, host_id, port_id,
                                              network_id, INTERNAL_TENANT_ID,
                                              port_name, device_owner)
@@ -380,18 +415,15 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               network_id,
                                               vm_id,
                                               network_context)
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.num_nets_provisioned.return_value = 0
         mechanism_arista.db_lib.num_vms_provisioned.return_value = 0
         self.drv.delete_port_precommit(port_context)
 
-        host_id = port_context.current['binding:host_id']
         port_id = port_context.current['id']
         expected_calls = [
-            mock.call.is_vm_provisioned(vm_id, host_id, port_id,
-                                        network_id, tenant_id),
-            mock.call.forget_vm(vm_id, host_id, port_id,
-                                network_id, tenant_id),
+            mock.call.is_port_provisioned(port_id),
+            mock.call.forget_port(port_id, port_context.host),
         ]
 
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
@@ -412,18 +444,15 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               vm_id,
                                               network_context)
         port_context.current['tenant_id'] = ''
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.num_nets_provisioned.return_value = 0
         mechanism_arista.db_lib.num_vms_provisioned.return_value = 0
         self.drv.delete_port_precommit(port_context)
 
-        host_id = port_context.current['binding:host_id']
         port_id = port_context.current['id']
         expected_calls += [
-            mock.call.is_vm_provisioned(vm_id, host_id, port_id,
-                                        network_id, INTERNAL_TENANT_ID),
-            mock.call.forget_vm(vm_id, host_id, port_id,
-                                network_id, INTERNAL_TENANT_ID),
+            mock.call.is_port_provisioned(port_id),
+            mock.call.forget_port(port_id, port_context.host),
         ]
 
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
@@ -453,9 +482,9 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.delete_port_postcommit(port_context)
 
         expected_calls = [
-            mock.call.is_network_provisioned(tenant_id, network_id),
-            mock.call.unplug_host_from_network(device_id, host_id, port_id,
-                                               network_id, tenant_id),
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
+            mock.call.unplug_port_from_network(device_id, 'compute', host_id,
+                                               port_id, network_id, tenant_id),
             mock.call.num_nets_provisioned(tenant_id),
             mock.call.num_vms_provisioned(tenant_id),
             mock.call.forget_tenant(tenant_id),
@@ -488,9 +517,11 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.delete_port_postcommit(port_context)
 
         expected_calls += [
-            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id),
-            mock.call.unplug_host_from_network(device_id, host_id, port_id,
-                                               network_id, INTERNAL_TENANT_ID),
+            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
+                                             None),
+            mock.call.unplug_port_from_network(device_id, 'compute', host_id,
+                                               port_id, network_id,
+                                               INTERNAL_TENANT_ID),
             mock.call.num_nets_provisioned(INTERNAL_TENANT_ID),
             mock.call.num_vms_provisioned(INTERNAL_TENANT_ID),
             mock.call.forget_tenant(INTERNAL_TENANT_ID),
@@ -500,6 +531,11 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
 
     def test_update_port_precommit(self):
+
+        # Test the case where the port was not provisioned previsouly
+        mechanism_arista.db_lib.is_port_provisioned.return_value = False
+        mechanism_arista.db_lib.is_network_provisioned.return_value = True
+
         tenant_id = 'ten-1'
         network_id = 'net1-id'
         segmentation_id = 1001
@@ -520,14 +556,16 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         self.drv.update_port_precommit(port_context)
 
         expected_calls = [
-            mock.call.update_vm_host(vm_id, host_id, port_id,
-                                     network_id, tenant_id)
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
+            mock.call.is_port_provisioned(port_id, None),
+            mock.call.remember_tenant(tenant_id),
+            mock.call.remember_vm(vm_id, host_id, port_id,
+                                  network_id, tenant_id)
         ]
 
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
 
-        # If there is no tenant id associated with the network, then the
-        # network should be created under the tenant id in the context.
+        # Test the case where the port was not provisioned
         tenant_id = 'ten-2'
         network_id = 'net2-id'
         segmentation_id = 1002
@@ -541,17 +579,91 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               network_id,
                                               vm_id,
                                               network_context)
+        host_id = port_context.current['binding:host_id']
+        port_context.original['binding:host_id'] = 'ubuntu0'
+        port_id = port_context.current['id']
+
+        # Force the check to return port found
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
+        mechanism_arista.db_lib.is_network_provisioned.return_value = True
+
+        self.drv.update_port_precommit(port_context)
+
+        expected_calls += [
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
+            mock.call.is_port_provisioned(port_id, None),
+            mock.call.update_port(vm_id, host_id, port_id,
+                                  network_id, tenant_id)
+        ]
+
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+        # If the tenant id is not specified, then the port should be created
+        # with internal tenant id.
+        tenant_id = 'ten-3'
+        network_id = 'net3-id'
+        segmentation_id = 1003
+        vm_id = 'vm3'
+
+        network_context = self._get_network_context(tenant_id,
+                                                    network_id,
+                                                    segmentation_id,
+                                                    False)
+        port_context = self._get_port_context(tenant_id,
+                                              network_id,
+                                              vm_id,
+                                              network_context)
+        # Port does not contain a tenant
         port_context.current['tenant_id'] = ''
         host_id = port_context.current['binding:host_id']
         port_context.original['binding:host_id'] = 'ubuntu0'
         port_id = port_context.current['id']
+
+        # Force the check to return port not found
+        mechanism_arista.db_lib.is_port_provisioned.return_value = False
+
         self.drv.update_port_precommit(port_context)
 
         expected_calls += [
-            mock.call.update_vm_host(vm_id, host_id, port_id,
-                                     network_id, INTERNAL_TENANT_ID)
+            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
+                                             None),
+            mock.call.is_port_provisioned(port_id, None),
+            mock.call.remember_tenant(INTERNAL_TENANT_ID),
+            mock.call.remember_vm(vm_id, host_id, port_id,
+                                  network_id, INTERNAL_TENANT_ID)
         ]
 
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+        router_id = 'r1'
+        # DVR ports
+        # <port, host> does not exist. It should be added to the DB
+        owner = n_const.DEVICE_OWNER_DVR_INTERFACE
+        port_context = self._get_port_context(tenant_id,
+                                              network_id,
+                                              router_id,
+                                              network_context,
+                                              device_owner=owner)
+        mechanism_arista.db_lib.is_port_provisioned.return_value = False
+        self.drv.update_port_precommit(port_context)
+        expected_calls += [
+            mock.call.is_network_provisioned(tenant_id, network_id,
+                                             None),
+            mock.call.is_port_provisioned(port_id, host_id),
+            mock.call.remember_tenant(tenant_id),
+            mock.call.remember_vm(router_id, host_id, port_id,
+                                  network_id, tenant_id)
+        ]
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+        # Unbind the port. It should be removed from the DB
+        port_context._port['binding:host_id'] = None
+        self.drv.update_port_precommit(port_context)
+        expected_calls += [
+            mock.call.is_network_provisioned(tenant_id, network_id,
+                                             None),
+            mock.call.forget_port(port_id, 'ubuntu1'),
+        ]
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
 
     def test_update_port_postcommit(self):
@@ -569,7 +681,7 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               vm_id,
                                               network_context)
 
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.get_shared_network_owner_id.return_value = 1
         mechanism_arista.db_lib.get_segmentation_id.return_value = 1001
@@ -590,13 +702,13 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         expected_calls = [
             mock.call.NeutronNets(),
             mock.call.get_segmentation_id(tenant_id, network_id),
-            mock.call.is_vm_provisioned(device_id, host_id, port_id,
-                                        network_id, tenant_id),
+            mock.call.is_port_provisioned(port_id, None),
             mock.call.is_network_provisioned(tenant_id, network_id,
                                              segmentation_id),
-            mock.call.is_network_provisioned(tenant_id, network_id),
-            mock.call.unplug_host_from_network(device_id, orig_host_id,
-                                               port_id, network_id, tenant_id),
+            mock.call.is_network_provisioned(tenant_id, network_id, None),
+            mock.call.unplug_port_from_network(device_id, 'compute',
+                                               orig_host_id, port_id,
+                                               network_id, tenant_id),
             mock.call.num_nets_provisioned(tenant_id),
             mock.call.num_vms_provisioned(tenant_id),
             mock.call.plug_port_into_network(device_id, host_id, port_id,
@@ -623,7 +735,7 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
                                               network_context)
         port_context.current['tenant_id'] = ''
 
-        mechanism_arista.db_lib.is_vm_provisioned.return_value = True
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
         mechanism_arista.db_lib.is_network_provisioned.return_value = True
         mechanism_arista.db_lib.get_shared_network_owner_id.return_value = 1
         mechanism_arista.db_lib.get_segmentation_id.return_value = 1002
@@ -643,12 +755,13 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
 
         expected_calls += [
             mock.call.get_segmentation_id(INTERNAL_TENANT_ID, network_id),
-            mock.call.is_vm_provisioned(device_id, host_id, port_id,
-                                        network_id, INTERNAL_TENANT_ID),
+            mock.call.is_port_provisioned(port_id, None),
             mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
                                              segmentation_id),
-            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id),
-            mock.call.unplug_host_from_network(device_id, orig_host_id,
+            mock.call.is_network_provisioned(INTERNAL_TENANT_ID, network_id,
+                                             None),
+            mock.call.unplug_port_from_network(device_id, 'compute',
+                                               orig_host_id,
                                                port_id, network_id,
                                                INTERNAL_TENANT_ID),
             mock.call.num_nets_provisioned(INTERNAL_TENANT_ID),
@@ -656,6 +769,76 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
             mock.call.plug_port_into_network(device_id, host_id, port_id,
                                              network_id, INTERNAL_TENANT_ID,
                                              port_name, device_owner)
+        ]
+
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+        # DVR ports
+        tenant_id = 'ten-3'
+        network_id = 'net3-id'
+        segmentation_id = 1003
+        router_id = 'r1'
+
+        network_context = self._get_network_context(tenant_id,
+                                                    network_id,
+                                                    segmentation_id,
+                                                    False)
+        owner = n_const.DEVICE_OWNER_DVR_INTERFACE
+        port_context = self._get_port_context(tenant_id,
+                                              network_id,
+                                              router_id,
+                                              network_context,
+                                              device_owner=owner)
+
+        mechanism_arista.db_lib.is_port_provisioned.return_value = True
+        mechanism_arista.db_lib.is_network_provisioned.return_value = True
+        mechanism_arista.db_lib.get_shared_network_owner_id.return_value = 1
+        mechanism_arista.db_lib.get_segmentation_id.return_value = 1003
+        mechanism_arista.db_lib.num_nets_provisioned.return_value = 1
+        mechanism_arista.db_lib.num_vms_provisioned.return_value = 1
+
+        # New DVR port - context.original_host is not set and status is ACTIVE
+        #                port should be plugged into the network
+        port = port_context.current
+        device_id = port['device_id']
+        device_owner = port['device_owner']
+        host_id = port['binding:host_id']
+        orig_host_id = 'ubuntu1'
+        port_id = port['id']
+        port_name = port['name']
+
+        self.drv.update_port_postcommit(port_context)
+
+        expected_calls += [
+            mock.call.get_segmentation_id(tenant_id, network_id),
+            mock.call.is_port_provisioned(port_id, port_context.host),
+            mock.call.is_network_provisioned(tenant_id, network_id,
+                                             segmentation_id),
+            mock.call.plug_port_into_network(device_id, host_id, port_id,
+                                             network_id, tenant_id,
+                                             port_name, device_owner)
+        ]
+
+        mechanism_arista.db_lib.assert_has_calls(expected_calls)
+
+        # Delete DVR port - context.original is set and the status is DOWN.
+        #                   port should be deleted
+        port_context._status = n_const.PORT_STATUS_DOWN
+        self.drv.update_port_postcommit(port_context)
+
+        expected_calls += [
+            mock.call.get_segmentation_id(tenant_id, network_id),
+            mock.call.is_port_provisioned(port_id, port_context.host),
+            mock.call.is_network_provisioned(tenant_id, network_id,
+                                             segmentation_id),
+            mock.call.is_network_provisioned(tenant_id, network_id,
+                                             None),
+            mock.call.unplug_port_from_network(device_id, owner,
+                                               orig_host_id,
+                                               port_id, network_id,
+                                               tenant_id),
+            mock.call.num_nets_provisioned(tenant_id),
+            mock.call.num_vms_provisioned(tenant_id),
         ]
 
         mechanism_arista.db_lib.assert_has_calls(expected_calls)
@@ -670,16 +853,25 @@ class AristaDriverTestCase(testlib_api.SqlTestCase):
         return FakeNetworkContext(tenant_id, network, network_segments,
                                   network)
 
-    def _get_port_context(self, tenant_id, net_id, vm_id, network):
-        port = {'device_id': vm_id,
-                'device_owner': 'compute',
+    def _get_port_context(self, tenant_id, net_id, device_id, network,
+                          device_owner='compute', status='ACTIVE'):
+        port = {'device_id': device_id,
+                'device_owner': device_owner,
                 'binding:host_id': 'ubuntu1',
                 'name': 'test-port',
                 'tenant_id': tenant_id,
                 'id': 101,
                 'network_id': net_id
                 }
-        return FakePortContext(port, dict(port), network)
+        orig_port = {'device_id': device_id,
+                     'device_owner': device_owner,
+                     'binding:host_id': 'ubuntu1',
+                     'name': 'test-port',
+                     'tenant_id': tenant_id,
+                     'id': 101,
+                     'network_id': net_id
+                     }
+        return FakePortContext(port, dict(orig_port), network, status)
 
 
 class fake_keystone_info_class(object):
@@ -721,10 +913,11 @@ class FakeNetworkContext(object):
 class FakePortContext(object):
     """To generate port context for testing purposes only."""
 
-    def __init__(self, port, original_port, network):
+    def __init__(self, port, original_port, network, status):
         self._port = port
         self._original_port = original_port
         self._network_context = network
+        self._status = status
 
     @property
     def current(self):
@@ -745,6 +938,10 @@ class FakePortContext(object):
     @property
     def original_host(self):
         return self._original_port.get(portbindings.HOST_ID)
+
+    @property
+    def status(self):
+        return self._status
 
 
 class FakePluginContext(object):
