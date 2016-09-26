@@ -24,8 +24,8 @@ Build-Depends-Indep: python-neutron (>= 1:7.0.0),
                      subunit,
                      testrepository,
 Standards-Version: 3.9.8
-Vcs-Browser: https://anonscm.debian.org/cgit/openstack/networking-arista.git/
-Vcs-Git: https://anonscm.debian.org/git/openstack/networking-arista.git
+Vcs-Browser: https://git.openstack.org/cgit/openstack/deb-networking-arista?h=debian%2Fnewton
+Vcs-Git: https://git.openstack.org/openstack/deb-networking-arista -b debian/newton
 Homepage: https://github.com/stackforge/networking-arista
 
 Package: python-networking-arista
