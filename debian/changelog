@@ -1,3 +1,11 @@
+networking-arista (2016.2.0-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Fixed (build-)depends for this release.
+  * Added missing python-testresources build-depends (Closes: #841515).
+
+ -- Thomas Goirand <zigo@debian.org>  Sat, 03 Dec 2016 13:14:32 +0100
+
 networking-arista (2016.1.0-1) unstable; urgency=medium
 
   [ Ondřej Nový ]

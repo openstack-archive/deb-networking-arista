@@ -15,6 +15,7 @@
 import copy
 import threading
 
+from neutron_lib import constants as n_const
 from oslo_config import cfg
 from oslo_log import helpers as log_helpers
 from oslo_log import log as logging
@@ -22,7 +23,6 @@ from oslo_utils import excutils
 
 from neutron.api.rpc.agentnotifiers import l3_rpc_agent_api
 from neutron.api.rpc.handlers import l3_rpc
-from neutron.common import constants as n_const
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron import context as nctx
@@ -30,11 +30,10 @@ from neutron.db import db_base_plugin_v2
 from neutron.db import extraroute_db
 from neutron.db import l3_agentschedulers_db
 from neutron.db import l3_gwmode_db
-from neutron.i18n import _LE
-from neutron.i18n import _LI
 from neutron.plugins.common import constants
 from neutron.plugins.ml2.driver_context import NetworkContext  # noqa
 
+from networking_arista._i18n import _LE, _LI
 from networking_arista.common import db_lib
 from networking_arista.l3Plugin import arista_l3_driver
 
@@ -67,7 +66,7 @@ class AristaL3ServicePlugin(db_base_plugin_v2.NeutronDbPluginV2,
     def setup_rpc(self):
         # RPC support
         self.topic = topics.L3PLUGIN
-        self.conn = n_rpc.create_connection(new=True)
+        self.conn = n_rpc.create_connection()
         self.agent_notifiers.update(
             {n_const.AGENT_TYPE_L3: l3_rpc_agent_api.L3AgentNotifyAPI()})
         self.endpoints = [l3_rpc.L3RpcCallback()]
@@ -103,10 +102,9 @@ class AristaL3ServicePlugin(db_base_plugin_v2.NeutronDbPluginV2,
         tenant_id = router['router']['tenant_id']
 
         # Add router to the DB
-        with context.session.begin(subtransactions=True):
-            new_router = super(AristaL3ServicePlugin, self).create_router(
-                context,
-                router)
+        new_router = super(AristaL3ServicePlugin, self).create_router(
+            context,
+            router)
         # create router on the Arista Hw
         try:
             self.driver.create_router(context, tenant_id, new_router)
@@ -122,13 +120,12 @@ class AristaL3ServicePlugin(db_base_plugin_v2.NeutronDbPluginV2,
     def update_router(self, context, router_id, router):
         """Update an existing router in DB, and update it in Arista HW."""
 
-        with context.session.begin(subtransactions=True):
-            # Read existing router record from DB
-            original_router = super(AristaL3ServicePlugin, self).get_router(
-                context, router_id)
-            # Update router DB
-            new_router = super(AristaL3ServicePlugin, self).update_router(
-                context, router_id, router)
+        # Read existing router record from DB
+        original_router = super(AristaL3ServicePlugin, self).get_router(
+            context, router_id)
+        # Update router DB
+        new_router = super(AristaL3ServicePlugin, self).update_router(
+            context, router_id, router)
 
         # Modify router on the Arista Hw
         try:
@@ -155,9 +152,7 @@ class AristaL3ServicePlugin(db_base_plugin_v2.NeutronDbPluginV2,
                           "router %(r)s exception=%(e)s"),
                       {'r': router, 'e': e})
 
-        with context.session.begin(subtransactions=True):
-            super(AristaL3ServicePlugin, self).delete_router(context,
-                                                             router_id)
+        super(AristaL3ServicePlugin, self).delete_router(context, router_id)
 
     @log_helpers.log_method_call
     def add_router_interface(self, context, router_id, interface_info):

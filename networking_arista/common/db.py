@@ -13,17 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from neutron_lib.db import constants as db_const
+from neutron_lib.db import model_base
 import sqlalchemy as sa
-
-from neutron.db import model_base
-from neutron.db import models_v2
 
 UUID_LEN = 36
 STR_LEN = 255
 
 
-class AristaProvisionedNets(model_base.BASEV2, models_v2.HasId,
-                            models_v2.HasTenant):
+class HasTenant(object):
+    """Tenant mixin, add to subclasses that have a tenant."""
+
+    tenant_id = sa.Column(sa.String(db_const.PROJECT_ID_FIELD_SIZE),
+                          index=True)
+
+
+class AristaProvisionedNets(model_base.BASEV2, model_base.HasId,
+                            HasTenant):
     """Stores networks provisioned on Arista EOS.
 
     Saves the segmentation ID for each network that is provisioned
@@ -40,11 +46,12 @@ class AristaProvisionedNets(model_base.BASEV2, models_v2.HasId,
                 u'segmentationTypeId': self.segmentation_id,
                 u'segmentationType': segmentation_type,
                 u'tenantId': self.tenant_id,
+                u'segmentId': self.id,
                 }
 
 
-class AristaProvisionedVms(model_base.BASEV2, models_v2.HasId,
-                           models_v2.HasTenant):
+class AristaProvisionedVms(model_base.BASEV2, model_base.HasId,
+                           HasTenant):
     """Stores VMs provisioned on Arista EOS.
 
     All VMs launched on physical hosts connected to Arista
@@ -57,21 +64,15 @@ class AristaProvisionedVms(model_base.BASEV2, models_v2.HasId,
     port_id = sa.Column(sa.String(UUID_LEN))
     network_id = sa.Column(sa.String(UUID_LEN))
 
-    def eos_vm_representation(self):
-        return {u'vmId': self.vm_id,
-                u'host': self.host_id,
-                u'ports': {self.port_id: [{u'portId': self.port_id,
-                                          u'networkId': self.network_id}]}}
-
     def eos_port_representation(self):
-        return {u'deviceId': self.vm_id,
+        return {u'portId': self.port_id,
+                u'deviceId': self.vm_id,
                 u'hosts': [self.host_id],
-                u'portId': self.port_id,
                 u'networkId': self.network_id}
 
 
-class AristaProvisionedTenants(model_base.BASEV2, models_v2.HasId,
-                               models_v2.HasTenant):
+class AristaProvisionedTenants(model_base.BASEV2, model_base.HasId,
+                               HasTenant):
     """Stores Tenants provisioned on Arista EOS.
 
     Tenants list is maintained for sync between Neutron and EOS.

@@ -18,17 +18,17 @@ import threading
 from oslo_config import cfg
 from oslo_log import log
 
-from neutron.i18n import _LI
-from neutron.plugins.ml2.drivers.type_vlan import VlanTypeDriver
+from neutron.plugins.ml2.drivers import type_vlan
 
+from networking_arista._i18n import _LI
 from networking_arista.common import config  # noqa
-from networking_arista.ml2.arista_ml2 import AristaRPCWrapper
-from networking_arista.ml2.drivers.driver_helpers import VlanSyncService
+from networking_arista.ml2 import arista_ml2
+from networking_arista.ml2.drivers import driver_helpers
 
 LOG = log.getLogger(__name__)
 
 
-class AristaVlanTypeDriver(VlanTypeDriver):
+class AristaVlanTypeDriver(type_vlan.VlanTypeDriver):
     """Manage state for VLAN networks with ML2.
 
     The VlanTypeDriver implements the 'vlan' network_type. VLAN
@@ -41,13 +41,13 @@ class AristaVlanTypeDriver(VlanTypeDriver):
 
     def __init__(self):
         super(AristaVlanTypeDriver, self).__init__()
-        self.rpc = AristaRPCWrapper()
-        self.sync_service = VlanSyncService(self.rpc)
+        self.rpc = arista_ml2.AristaRPCWrapperEapi()
+        self.sync_service = driver_helpers.VlanSyncService(self.rpc)
         self.network_vlan_ranges = dict()
         self.sync_timeout = cfg.CONF.arista_type_driver['sync_interval']
 
     def initialize(self):
-        self.rpc.check_cli_commands()
+        self.rpc.check_supported_features()
         self.rpc.check_vlan_type_driver_commands()
         self._synchronization_thread()
         LOG.info(_LI("AristaVlanTypeDriver initialization complete"))
